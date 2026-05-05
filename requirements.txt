@@ -2,3 +2,4 @@ tensorflow
 numpy
 requests
 aiohttp
+beautifulsoup4
