@@ -3,8 +3,8 @@ evaluate_model.py
 
 Evaluates the trained malicious-site classifier against the remainder of the
 shuffled dataset that was NOT used during training (i.e. everything after the
-first 20,000 entries). Fetches HTML via curl, runs inference, and produces a
-detailed accuracy report.
+first 20,000 entries). Fetches HTML via curl in parallel, runs inference, and
+produces a detailed accuracy report.
 
 Usage:
     python evaluate_model.py --dataset websites_labeled.csv
@@ -14,6 +14,7 @@ Optional flags:
     --model-dir     Path to saved model                     — default: ./model_output/model_final
     --skip          How many rows were used for training     — default: 20000
     --timeout       Curl timeout per site in seconds         — default: 10
+    --workers       Concurrent fetch threads                 — default: 32
     --threshold     Score threshold for malicious (0-1)      — default: 0.5
     --failed-log    Path to failed URLs log                  — default: ./failed_eval_urls.log
     --output        Path for per-site results CSV            — default: ./eval_results.csv
@@ -27,6 +28,8 @@ import os
 import random
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -76,6 +79,59 @@ def fetch_html(domain: str, timeout: int) -> str | None:
         except Exception:
             continue
     return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Multithreaded batch fetching
+# ─────────────────────────────────────────────────────────────────────────────
+
+_print_lock = threading.Lock()
+
+
+def fetch_batch_parallel(
+    batch: list[tuple[str, int]],
+    timeout: int,
+    failed_log: Path,
+    workers: int,
+) -> tuple[list[str], list[int], list[str], int]:
+    """
+    Fetch HTML for all domains in batch concurrently.
+    Returns (html_list, label_list, domain_list, n_failed) in original order.
+    """
+    total = len(batch)
+    raw: dict[str, tuple[int, str | None]] = {}  # domain → (label, html)
+
+    def _fetch_one(idx, domain, label):
+        html = fetch_html(domain, timeout)
+        status = f"OK ({len(html):,} chars)" if html else "FAILED"
+        with _print_lock:
+            print(f"  [{idx:>{len(str(total))}}/{total}] {domain} ... {status}")
+        if not html:
+            with _print_lock:
+                with failed_log.open("a", encoding="utf-8") as f:
+                    f.write(f"{datetime.now().isoformat()}\t{domain}\n")
+        return domain, label, html
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(_fetch_one, i, domain, label): domain
+            for i, (domain, label) in enumerate(batch, 1)
+        }
+        for future in as_completed(futures):
+            domain, label, html = future.result()
+            raw[domain] = (label, html)
+
+    html_list, label_list, domain_list, n_failed = [], [], [], 0
+    for domain, label in batch:          # preserve original order
+        _, html = raw[domain]
+        if html:
+            html_list.append(html)
+            label_list.append(label)
+            domain_list.append(domain)
+        else:
+            n_failed += 1
+
+    return html_list, label_list, domain_list, n_failed
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -157,9 +213,11 @@ def print_report(m: dict, n_malicious: int, n_benign: int) -> None:
 def main():
     parser = argparse.ArgumentParser(description="Evaluate malicious-site classifier.")
     parser.add_argument("--dataset",    default="websites_labeled.csv")
-    parser.add_argument("--model-dir",  default="./model_output/model_final")
+    parser.add_argument("--model-dir",  default="./model_output/model_final.keras")
     parser.add_argument("--skip",       type=int,   default=20_000)
     parser.add_argument("--timeout",    type=int,   default=10)
+    parser.add_argument("--workers",    type=int,   default=32,
+                        help="Concurrent fetch threads per batch")
     parser.add_argument("--threshold",  type=float, default=0.5)
     parser.add_argument("--failed-log", default="./failed_eval_urls.log")
     parser.add_argument("--output",     default="./eval_results.csv")
@@ -215,24 +273,13 @@ def main():
 
     for b_idx, batch in enumerate(batches, 1):
         print(f"=== Eval batch {b_idx} / {len(batches)} "
-              f"({len(batch)} sites) ===")
+              f"({len(batch)} sites) — fetching with {args.workers} threads ===")
 
-        html_list, label_list, domain_list = [], [], []
-
-        for i, (domain, label) in enumerate(batch, 1):
-            print(f"  [{i:>4}/{len(batch)}] {domain} ... ", end="", flush=True)
-            html = fetch_html(domain, args.timeout)
-            if html:
-                html_list.append(html)
-                label_list.append(label)
-                domain_list.append(domain)
-                fetched_total += 1
-                print(f"OK ({len(html):,} chars)")
-            else:
-                failed_total += 1
-                print("FAILED")
-                with failed_log.open("a", encoding="utf-8") as f:
-                    f.write(f"{datetime.now().isoformat()}\t{domain}\n")
+        html_list, label_list, domain_list, n_failed = fetch_batch_parallel(
+            batch, args.timeout, failed_log, args.workers
+        )
+        failed_total += n_failed
+        fetched_total += len(html_list)
 
         if not html_list:
             print("  No HTML fetched in this batch — skipping inference.\n")

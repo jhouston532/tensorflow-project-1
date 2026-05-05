@@ -3,7 +3,7 @@ train_model.py
 
 Trains a simple TensorFlow text-classification model to detect malicious websites
 based on their raw HTML content. Processes websites in batches of 2000, fetching
-HTML via curl, up to a total of 20,000 websites.
+HTML via curl in parallel, up to a total of 20,000 websites.
 
 Usage:
     python train_model.py --dataset websites_labeled.csv
@@ -16,6 +16,7 @@ Optional flags:
     --max-tokens      Vocabulary size for text vectorization  — default: 20000
     --max-len         Max HTML token sequence length          — default: 1000
     --timeout         Curl timeout per site in seconds        — default: 10
+    --workers         Concurrent fetch threads                — default: 32
     --output-dir      Where to save model + logs              — default: ./model_output
     --failed-log      Path to failed URLs log                 — default: ./failed_urls.log
     --seed            Random seed                             — default: 42
@@ -27,7 +28,8 @@ import os
 import random
 import subprocess
 import sys
-import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -129,31 +131,63 @@ def build_model(max_tokens: int, max_len: int) -> tuple:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Batch fetching
+# Batch fetching (multithreaded)
 # ─────────────────────────────────────────────────────────────────────────────
+
+# Thread-safe counter for progress reporting
+_print_lock = threading.Lock()
+
+
+def _fetch_one(
+    idx: int,
+    total: int,
+    domain: str,
+    label: int,
+    timeout: int,
+    failed_log: Path,
+) -> tuple[str, int, str | None]:
+    """Fetch a single domain and return (domain, label, html|None)."""
+    html = fetch_html(domain, timeout)
+    status = f"OK ({len(html):,} chars)" if html else "FAILED"
+    with _print_lock:
+        print(f"  [{idx:>{len(str(total))}}/{total}] {domain} ... {status}")
+    if not html:
+        with _print_lock:
+            with failed_log.open("a", encoding="utf-8") as f:
+                f.write(f"{datetime.now().isoformat()}\t{domain}\n")
+    return domain, label, html
+
 
 def fetch_batch(
     batch: list[tuple[str, int]],
     timeout: int,
     failed_log: Path,
+    workers: int = 32,
 ) -> tuple[list[str], list[int]]:
     """
-    Fetch HTML for every domain in the batch.
-    Logs failures and skips them.
+    Fetch HTML for every domain in the batch concurrently.
+    Results are re-ordered to match the original batch order.
     Returns (html_texts, labels).
     """
+    total = len(batch)
+    results: dict[str, tuple[int, str | None]] = {}  # domain → (label, html)
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(_fetch_one, i, total, domain, label, timeout, failed_log): domain
+            for i, (domain, label) in enumerate(batch, 1)
+        }
+        for future in as_completed(futures):
+            domain, label, html = future.result()
+            results[domain] = (label, html)
+
+    # Rebuild in original order so labels stay aligned
     texts, labels = [], []
-    for i, (domain, label) in enumerate(batch, 1):
-        print(f"  [{i}/{len(batch)}] {domain} ... ", end="", flush=True)
-        html = fetch_html(domain, timeout)
+    for domain, label in batch:
+        _, html = results[domain]
         if html:
             texts.append(html)
             labels.append(label)
-            print(f"OK ({len(html):,} chars)")
-        else:
-            print("FAILED")
-            with failed_log.open("a", encoding="utf-8") as f:
-                f.write(f"{datetime.now().isoformat()}\t{domain}\n")
     return texts, labels
 
 
@@ -170,6 +204,8 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=20_000)
     parser.add_argument("--max-len",    type=int, default=1_000)
     parser.add_argument("--timeout",    type=int, default=10)
+    parser.add_argument("--workers",    type=int, default=32,
+                        help="Concurrent fetch threads per batch")
     parser.add_argument("--output-dir", default="./model_output")
     parser.add_argument("--failed-log", default="./failed_urls.log")
     parser.add_argument("--seed",       type=int, default=42)
@@ -198,7 +234,7 @@ def main():
 
     # ── Fetch first batch to fit the vectorizer ───────────────────────────────
     print(f"=== Batch 1 / {n_batches} — fetching HTML (vectorizer warm-up) ===")
-    texts_0, labels_0 = fetch_batch(batches[0], args.timeout, failed_log)
+    texts_0, labels_0 = fetch_batch(batches[0], args.timeout, failed_log, args.workers)
 
     if not texts_0:
         sys.exit("First batch returned no HTML. Check connectivity and try again.")
@@ -220,7 +256,7 @@ def main():
             texts, labels = texts_0, labels_0   # already fetched
         else:
             print(f"\n=== Batch {b_num} / {n_batches} — fetching HTML ===")
-            texts, labels = fetch_batch(batch, args.timeout, failed_log)
+            texts, labels = fetch_batch(batch, args.timeout, failed_log, args.workers)
 
         if not texts:
             print(f"  Batch {b_num} produced no usable HTML — skipping.")
